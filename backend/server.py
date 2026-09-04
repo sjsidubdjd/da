@@ -282,9 +282,11 @@ async def startup():
         await _seed_coa_canon(_db)
         _rep = await migrate_coa_canonical(_db)
         _prof = await upgrade_posting_profiles(_db)
+        from routes.rahaza_ar_canonical import migrate_ar_canonical
+        _arc = await migrate_ar_canonical(_db)
         logger.info(f"COA kanonik: deactivated={len(_rep['deactivated'])} type_fixed={len(_rep['type_fixed'])} "
                     f"parent_fixed={len(_rep['parent_fixed'])} legacy_used={_rep['legacy_still_used']} "
-                    f"profiles_updated={_prof['updated']}")
+                    f"profiles_updated={_prof['updated']} ar_canonical_updated={_arc['updated']}")
     except Exception as e:
         logger.warning(f"Phase 7D auto-seed: {e}")
     

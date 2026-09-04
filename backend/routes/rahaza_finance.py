@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/rahaza", tags=["rahaza-finance"],
                    dependencies=[Depends(require_portal_dep("finance"))])  # RBAC: portal finance (BUG-RBAC-1)
 
-AR_STATUS = ["draft", "sent", "partial_paid", "paid", "overdue", "cancelled"]
+AR_STATUS = ["draft", "issued", "sent", "partial_paid", "paid", "overdue", "written_off", "cancelled"]
 AP_STATUS = ["draft", "sent", "partial_paid", "paid", "cancelled"]
 
 
@@ -249,6 +249,7 @@ async def create_ar(request: Request):
         "items": norm_items, "subtotal": round(subtotal), "tax_pct": tax_pct, "tax_amount": tax,
         "discount_amount": discount_amount,  # Phase 9C
         "total": total, "paid_amount": 0, "balance": total,
+        "total_amount": total, "amount_paid": 0, "amount_due": total,  # skema kanonik (H-01)
         "status": "draft", "notes": body.get("notes") or "",
         "sales_channel": (body.get("sales_channel") or "").strip() or None,
         "created_at": _now(), "updated_at": _now(),
@@ -270,13 +271,15 @@ async def change_ar_status(iid: str, request: Request):
     if not inv:
         raise HTTPException(404, "Invoice tidak ditemukan.")
     old_status = inv.get("status")
+    if new_status == "sent":
+        new_status = "issued"   # kanonik (H-01)
     await db.rahaza_ar_invoices.update_one({"id": iid}, {"$set": {"status": new_status, "updated_at": _now()}})
     out = await db.rahaza_ar_invoices.find_one({"id": iid}, {"_id": 0})
 
     # ── F2 Auto-post hook ────────────────────────────────────────────────────
     posting_result = None
     try:
-        if new_status == "sent" and old_status != "sent" and not out.get("gl_je_id"):
+        if new_status == "issued" and old_status not in ("issued", "sent") and not out.get("gl_je_id"):
             posting_result = await post_ar_invoice(db, out, user)
         elif new_status == "cancelled" and out.get("gl_je_id"):
             posting_result = await void_ar_invoice_posting(db, iid, user, reason="AR cancelled")
@@ -299,9 +302,9 @@ async def send_ar_invoice(iid: str, request: Request):
     inv = await db.rahaza_ar_invoices.find_one({"id": iid}, {"_id": 0})
     if not inv:
         raise HTTPException(404, "Invoice tidak ditemukan.")
-    if inv.get("status") not in ("draft", "sent"):
-        raise HTTPException(400, f"Hanya draft/sent yang bisa di-send. Status: {inv.get('status')}")
-    await db.rahaza_ar_invoices.update_one({"id": iid}, {"$set": {"status": "sent", "updated_at": _now()}})
+    if inv.get("status") not in ("draft", "sent", "issued"):
+        raise HTTPException(400, f"Hanya draft/issued yang bisa di-send. Status: {inv.get('status')}")
+    await db.rahaza_ar_invoices.update_one({"id": iid}, {"$set": {"status": "issued", "updated_at": _now()}})
     out = await db.rahaza_ar_invoices.find_one({"id": iid}, {"_id": 0})
     posting_result = None
     try:
@@ -361,7 +364,9 @@ async def record_ar_payment(iid: str, request: Request):
                           {"$subtract": [{"$ifNull": ["$total", 0]}, 0.01]}]},
                 "paid", "partial_paid"]},
             "updated_at": _now(),
-        }}],
+        }},
+         # cermin kanonik (H-01)
+         {"$set": {"total_amount": {"$ifNull": ["$total", 0]}, "amount_paid": "$paid_amount", "amount_due": "$balance"}}],
         return_document=ReturnDocument.AFTER,
     )
     if not updated:
@@ -479,6 +484,7 @@ async def write_off_bad_debt(iid: str, request: Request):
             "write_off_date": write_off_date,
             "write_off_reason": reason,
             "write_off_amount": round(balance, 2),
+            "amount_due": 0, "balance": 0,
             "write_off_by": user.get("id"),
             "write_off_by_name": user.get("name", ""),
             "write_off_at": _now(),
@@ -529,7 +535,7 @@ async def get_overdue_ar_report(request: Request, days: int = 30):
     
     # Get all sent/overdue/partial_paid invoices with balance > 0
     query = {
-        "status": {"$in": ["sent", "overdue", "partial_paid"]},
+        "status": {"$in": ["sent", "issued", "overdue", "partial_paid"]},
         "balance": {"$gt": 0}
     }
     
@@ -599,51 +605,14 @@ async def get_overdue_ar_report(request: Request, days: int = 30):
     })
 
 @router.get("/ar-aging")
-async def ar_aging(request: Request):
+async def ar_aging(request: Request, source: Optional[str] = None):
+    """Aging piutang TUNGGAL (internal + maklon) — skema kanonik (H-01). ?source=internal|maklon."""
     await require_auth(request)
     db = get_db()
-    today = date.today()
-    rows = await db.rahaza_ar_invoices.find({"status": {"$in": ["sent", "partial_paid", "overdue"]}}, {"_id": 0}).to_list(500)
-    buckets = {"current": 0, "1_30": 0, "31_60": 0, "61_90": 0, "90_plus": 0,
-               # 2026-08-07 — ember BARU. DULU invoice yang `due_date`-nya rusak/kosong
-               # dipaksa `days_overdue = 0` sehingga masuk ember **"current"** — artinya
-               # piutang yang mungkin sudah lewat berbulan-bulan DILAPORKAN SEBAGAI
-               # BELUM JATUH TEMPO. Itu bukan sekadar baris hilang, itu angka yang
-               # menyesatkan pengambil keputusan. Sekarang uangnya tetap ikut dihitung
-               # (total tidak berubah) tetapi diberi label jujur.
-               "tanpa_jatuh_tempo": 0}
-    dq = SkipTracker("aging AR")
-    details = []
-    for r in rows:
-        tanggal_sah = True
-        try:
-            due = datetime.strptime(r["due_date"], "%Y-%m-%d").date()
-            days_overdue = (today - due).days
-        except (KeyError, ValueError, TypeError) as e:
-            tanggal_sah = False
-            days_overdue = 0
-            dq.skip(doc_id=r.get("id"), label=r.get("invoice_number"),
-                    field="due_date", value=r.get("due_date"), error=e)
-        balance = float(r.get("balance") or 0)
-        if not tanggal_sah:
-            buckets["tanpa_jatuh_tempo"] += balance
-        elif days_overdue <= 0:
-            buckets["current"] += balance
-        elif days_overdue <= 30:
-            buckets["1_30"] += balance
-        elif days_overdue <= 60:
-            buckets["31_60"] += balance
-        elif days_overdue <= 90:
-            buckets["61_90"] += balance
-        else:
-            buckets["90_plus"] += balance
-        details.append({**r, "days_overdue": days_overdue,
-                        "due_date_valid": tanggal_sah})
-    dq.log(logger)
-    return {"buckets": {k: round(v) for k, v in buckets.items()},
-            "total": round(sum(buckets.values())),
-            "details": serialize_doc(details),
-            "data_quality": dq.as_dict()}
+    from routes.rahaza_ar_canonical import compute_ar_aging
+    res = await compute_ar_aging(db, source=source or None)
+    return {"buckets": {k: round(v) for k, v in res["buckets"].items()}, "total": round(res["total"]),
+            "count": res["count"], "details": serialize_doc(res["rows"]), "data_quality": res["data_quality"]}
 
 
 # ── AP INVOICES ──────────────────────────────────────────────────────────────
@@ -1056,7 +1025,7 @@ async def finance_summary(request: Request):
     db = get_db()
     # AR outstanding
     ar = await db.rahaza_ar_invoices.aggregate([
-        {"$match": {"status": {"$in": ["sent", "partial_paid", "overdue"]}}},
+        {"$match": {"status": {"$in": ["sent", "issued", "partial_paid", "overdue"]}}},
         {"$group": {"_id": None, "outstanding": {"$sum": "$balance"}, "count": {"$sum": 1}}},
     ]).to_list(500)
     ap = await db.rahaza_ap_invoices.aggregate([

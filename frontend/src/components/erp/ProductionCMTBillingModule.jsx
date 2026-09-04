@@ -89,6 +89,39 @@ export default function ProductionCMTBillingModule({ portalId, userRole }) {
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [posting, setPosting] = useState('');
+  const [payOpen, setPayOpen] = useState(false);
+  const [cashAccounts, setCashAccounts] = useState([]);
+  const [payForm, setPayForm] = useState({ cash_account_id: '', amount: '', payment_date: new Date().toISOString().slice(0, 10), reference_no: '' });
+  const [disbursements, setDisbursements] = useState([]);
+  useEffect(() => {
+    apiGet('/rahaza/cash-accounts').then(d => setCashAccounts(Array.isArray(d) ? d : [])).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!detail?.bill?.id) { setDisbursements([]); return; }
+    apiGet(`/dewi/maklon/finance/cmt-payments/${detail.bill.id}/disbursements`).then(d => setDisbursements(Array.isArray(d) ? d : [])).catch(() => {});
+  }, [detail?.bill?.id, detail?.bill?.paid_amount]);
+  const payCmt = async () => {
+    if (!payForm.cash_account_id) { toast.error('Pilih rekening kas/bank'); return; }
+    setPosting(detail.bill.id);
+    try {
+      const r = await apiPost(`/dewi/maklon/finance/cmt-payments/${detail.bill.id}/pay`, {
+        cash_account_id: payForm.cash_account_id, amount: payForm.amount ? Number(payForm.amount) : null,
+        payment_date: payForm.payment_date, reference_no: payForm.reference_no,
+      });
+      if (r?.post_error) toast.warning(`Pembayaran dicatat, jurnal gagal: ${r.post_error}`);
+      else toast.success(`Pembayaran dicatat · Jurnal ${r?.gl_je_number || '-'} · status ${r?.payment_status}`);
+      setPayOpen(false); setPayForm(f => ({ ...f, amount: '', reference_no: '' }));
+      await load(); await openDetail(detail.bill.id);
+    } catch (e) { toast.error(`Bayar gagal: ${e?.message || e}`); } finally { setPosting(''); }
+  };
+  const voidDisbursement = async (did) => {
+    if (!window.confirm('Batalkan pembayaran ini? Jurnal akan di-void.')) return;
+    try {
+      await apiPost(`/dewi/maklon/finance/cmt-payments/${detail.bill.id}/disbursements/${did}/void`, {});
+      toast.success('Pembayaran dibatalkan, jurnal di-void');
+      await load(); await openDetail(detail.bill.id);
+    } catch (e) { toast.error(`Void gagal: ${e?.message || e}`); }
+  };
 
   const canPost = ['superadmin', 'admin', 'owner', 'accounting', 'staff_keuangan', 'manager_keuangan']
     .includes((userRole || '').toLowerCase());
@@ -472,6 +505,45 @@ export default function ProductionCMTBillingModule({ portalId, userRole }) {
                     </div>
                   )}
                 </div>
+
+                {canPost && (detail.bill?.status || '').toLowerCase() !== 'cancelled' && (
+                  <div className="rounded-lg border border-border p-3 space-y-2" data-testid="cmt-pay-panel">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm font-semibold">Pembayaran ke Vendor</p>
+                      <span className="text-xs text-muted-foreground">Dibayar {fmtNum(detail.bill?.paid_amount || 0)} · Sisa {fmtNum(detail.bill?.outstanding_amount ?? 0)}</span>
+                    </div>
+                    {disbursements.length > 0 && (
+                      <ul className="text-xs space-y-1">
+                        {disbursements.map(d => (
+                          <li key={d.id} className="flex items-center justify-between gap-2" data-testid={`cmt-disb-${d.id}`}>
+                            <span>{d.payment_date} · {d.cash_account_name} · {fmtNum(d.amount)} {d.gl_je_number ? `· ${d.gl_je_number}` : ''}</span>
+                            <Button size="sm" variant="ghost" className="h-6 px-2 text-red-600" onClick={() => voidDisbursement(d.id)} data-testid={`cmt-disb-void-${d.id}`}>Void</Button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {(detail.bill?.outstanding_amount ?? 1) > 0 && !payOpen && (
+                      <Button size="sm" onClick={() => setPayOpen(true)} data-testid="cmt-pay-open">Bayar Vendor</Button>
+                    )}
+                    {payOpen && (
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="col-span-2">
+                          <SmartNativeSelect value={payForm.cash_account_id} onChange={e => setPayForm(f => ({ ...f, cash_account_id: e.target.value }))} data-testid="cmt-pay-cash-account">
+                            <option value="">— Rekening kas/bank —</option>
+                            {cashAccounts.map(a => <option key={a.id} value={a.id}>{a.name}{a.gl_account_code ? ` · ${a.gl_account_code}` : ''}</option>)}
+                          </SmartNativeSelect>
+                        </div>
+                        <Input type="number" placeholder="Jumlah (kosong = sisa)" value={payForm.amount} onChange={e => setPayForm(f => ({ ...f, amount: e.target.value }))} data-testid="cmt-pay-amount" />
+                        <Input type="date" value={payForm.payment_date} onChange={e => setPayForm(f => ({ ...f, payment_date: e.target.value }))} data-testid="cmt-pay-date" />
+                        <Input placeholder="No. referensi" value={payForm.reference_no} onChange={e => setPayForm(f => ({ ...f, reference_no: e.target.value }))} data-testid="cmt-pay-ref" />
+                        <div className="flex gap-2 justify-end">
+                          <Button size="sm" variant="outline" onClick={() => setPayOpen(false)}>Batal</Button>
+                          <Button size="sm" onClick={payCmt} disabled={posting === detail.bill?.id} data-testid="cmt-pay-submit">Catat Bayar</Button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {detail.bill?.notes && (
                   <div>

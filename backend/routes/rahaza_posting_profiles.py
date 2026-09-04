@@ -160,7 +160,10 @@ DEFAULT_PROFILES = [
         "event_type": "cmt_ap_invoice",
         "description": "CMT Vendor AP Invoice → Dr Biaya Vendor CMT / Cr AP Vendor",
         "mapping": {
-            "debit_cmt_expense_internal": "5-231",  # Biaya Vendor CMT – Jahit (COGS produksi DA)
+            # C-03 absorption: upah jahit PO INTERNAL dikapitalisasi ke WIP (bukan langsung COGS);
+            # COGS lahir saat dispatch dari lapisan FG (bahan+jahit+overhead) — tidak dobel.
+            "debit_cmt_wip_internal": "1-1403",
+            "debit_cmt_expense_internal": "5-231",  # dipakai HANYA bila debit_cmt_wip_internal kosong
             "debit_cmt_expense_maklon": "7-120",    # Biaya Vendor CMT – Maklon (biaya proyek klien)
             "credit_ap": "2-1100",
             "debit_penalty_income": "4-9000",
@@ -355,6 +358,7 @@ PROFILE_CODE_FIXES = {
     ("variance_overproduction", "credit_variance_income"): "4-9000",
     ("bank_recon_interest", "credit_interest_income"): "4-2100",
     ("cogs_shipment", "debit_cogs_overhead"): "5-3500",
+    ("cmt_ap_invoice", "debit_cmt_wip_internal"): "1-1403",   # C-03 absorption
 }
 # Kunci role legacy (dewi_kasbon) → kunci kanonik
 PROFILE_ROLE_RENAMES = {

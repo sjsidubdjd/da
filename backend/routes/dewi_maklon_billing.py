@@ -146,11 +146,13 @@ async def _recalc_invoice(db, invoice_id: str) -> dict:
     # SATU SUMBER INVOICE: dokumen layar Invoice adalah cermin AR otomatis (`rahaza_ar_invoices`,
     # id sama). Pembayaran/pajak/status dirambatkan supaya Finance & Maklon membaca angka yang sama.
     if inv.get('ar_invoice_id'):
-        ar_status = {'paid': 'paid', 'cancelled': 'cancelled', 'draft': 'draft'}.get(status, 'issued')
+        ar_status = {'paid': 'paid', 'cancelled': 'cancelled', 'draft': 'draft', 'partial_paid': 'partial_paid',
+                     'overdue': 'overdue'}.get(status, 'issued')
         await db.rahaza_ar_invoices.update_one({'id': inv['ar_invoice_id']}, {'$set': {
             'tax_pct': tax_pct, 'tax_amount': tax_amount, 'discount_amount': discount,
             'subtotal': round(subtotal, 2), 'total_amount': total,
             'amount_paid': paid, 'amount_due': balance, 'status': ar_status,
+            'total': total, 'paid_amount': paid, 'balance': balance,  # cermin lama (H-01)
             'updated_at': datetime.now(timezone.utc)}})
     return update
 
@@ -839,68 +841,16 @@ async def monthly_billing(
 
 @router.get('/reports/aging')
 async def aging_report(user: dict = Depends(require_auth)):
-    """Aging analysis: outstanding invoices grouped by age buckets."""
+    """Aging tagihan maklon — membaca sumber yang SAMA dgn /api/rahaza/ar-aging (H-01), filter source=maklon."""
     db = get_db()
-    invoices = await db.dewi_maklon_invoices.find({
-        'status': {'$in': ['issued', 'partial_paid', 'overdue']},
-        'balance_amount': {'$gt': 0},
-    }).to_list(length=2000)
-
-    today = datetime.now(timezone.utc).date()
-    # `tanpa_jatuh_tempo`: 2026-08-07 — DULU invoice yang tanggalnya rusak
-    # di-`continue` sehingga LENYAP dari aging DAN dari total; uang outstanding
-    # nyata jadi tak terlihat sama sekali. Sekarang tetap dihitung, dengan label
-    # jujur, dan barisnya tetap muncul supaya bisa diperbaiki.
-    buckets = {'current': 0.0, '1_30': 0.0, '31_60': 0.0, '61_90': 0.0, 'over_90': 0.0,
-               'tanpa_jatuh_tempo': 0.0}
-    dq = SkipTracker("aging tagihan maklon")
-    rows = []
-    for i in invoices:
-        bal = float(i.get('balance_amount', 0) or 0)
-        try:
-            due = date.fromisoformat(i.get('due_date') or '2099-12-31')
-        except (ValueError, TypeError) as e:
-            dq.skip(doc_id=i.get('id'), label=i.get('invoice_number'),
-                    field='due_date', value=i.get('due_date'), error=e)
-            buckets['tanpa_jatuh_tempo'] += bal
-            rows.append({
-                'invoice_number': i.get('invoice_number'),
-                'client_name': i.get('client_name'),
-                'issue_date': i.get('issue_date'),
-                'due_date': i.get('due_date'),
-                'total_amount': float(i.get('total_amount', 0) or 0),
-                'balance_amount': bal,
-                'days_overdue': 0,
-                'bucket': 'tanpa_jatuh_tempo',
-                'due_date_valid': False,
-            })
-            continue
-        days_overdue = (today - due).days
-        if days_overdue <= 0:
-            bucket = 'current'
-        elif days_overdue <= 30:
-            bucket = '1_30'
-        elif days_overdue <= 60:
-            bucket = '31_60'
-        elif days_overdue <= 90:
-            bucket = '61_90'
-        else:
-            bucket = 'over_90'
-        buckets[bucket] += bal
-        rows.append({
-            'invoice_number': i.get('invoice_number'),
-            'client_name': i.get('client_name'),
-            'issue_date': i.get('issue_date'),
-            'due_date': i.get('due_date'),
-            'total_amount': float(i.get('total_amount', 0) or 0),
-            'balance_amount': bal,
-            'days_overdue': max(days_overdue, 0),
-            'bucket': bucket,
-            'due_date_valid': True,
-        })
-
-    for k in buckets:
-        buckets[k] = round(buckets[k], 2)
-    rows.sort(key=lambda x: -x['days_overdue'])
-    dq.log(logger)
-    return {'buckets': buckets, 'rows': rows, 'data_quality': dq.as_dict()}
+    from routes.rahaza_ar_canonical import compute_ar_aging
+    res = await compute_ar_aging(db, source='maklon')
+    b = res['buckets']
+    buckets = {'current': b['current'], '1_30': b['1_30'], '31_60': b['31_60'], '61_90': b['61_90'],
+               'over_90': b['90_plus'], 'tanpa_jatuh_tempo': b['tanpa_jatuh_tempo']}
+    rows = [{'invoice_number': r.get('invoice_number'), 'client_name': r.get('client_name'),
+             'issue_date': r.get('invoice_date') or r.get('issue_date'), 'due_date': r.get('due_date'),
+             'total_amount': r['total_amount'], 'balance_amount': r['amount_due'], 'status': r['status'],
+             'days_overdue': r['days_overdue'], 'bucket': 'over_90' if r['bucket'] == '90_plus' else r['bucket'],
+             'due_date_valid': r['due_date_valid']} for r in res['rows']]
+    return {'buckets': buckets, 'rows': rows, 'total': res['total'], 'data_quality': res['data_quality']}

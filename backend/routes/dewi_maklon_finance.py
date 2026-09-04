@@ -225,8 +225,11 @@ async def _cmt_expense_account(db, cmt_payment: dict, mapping: dict) -> tuple:
             domain = 'internal'
     elif cmt_payment.get('job_ids'):
         domain = 'internal'   # CMT-flow: DA menjahitkan produk DA sendiri
-    key = 'debit_cmt_expense_internal' if domain == 'internal' else 'debit_cmt_expense_maklon'
-    code = mapping.get(key) or mapping.get('debit_cmt_expense')
+    if domain == 'internal':
+        # C-03: absorption — upah jahit produk DA sendiri → WIP (1-1403), keluar ke FG saat job selesai
+        code = mapping.get('debit_cmt_wip_internal') or mapping.get('debit_cmt_expense_internal') or mapping.get('debit_cmt_expense')
+    else:
+        code = mapping.get('debit_cmt_expense_maklon') or mapping.get('debit_cmt_expense')
     if code == '6-2200':   # profil lama yang keliru (Listrik & Air Kantor) → ditolak, bukan ditebak
         code = None
     return code, domain
@@ -459,3 +462,104 @@ async def post_ap_for_cmt_payment(payment_id: str, user: dict = Depends(require_
         'je_number': result.get('je_number'),
         'already_posted': result.get('already_posted', False),
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# H-03: PEMBAYARAN TAGIHAN CMT (Dr AP vendor CMT — akun sama dgn AP invoice / Cr Bank)
+# ──────────────────────────────────────────────────────────────────────────────
+class CmtPayIn(BaseModel):
+    cash_account_id: str
+    amount: Optional[float] = Field(default=None, gt=0)
+    payment_date: Optional[str] = None
+    reference_no: Optional[str] = None
+    notes: Optional[str] = None
+
+
+def _cmt_amount(p: dict) -> float:
+    return float(p.get('net_amount') if p.get('net_amount') is not None else p.get('total_amount') or p.get('subtotal') or 0)
+
+
+@router.get('/cmt-payments/{payment_id}/disbursements')
+async def list_cmt_disbursements(payment_id: str, user: dict = Depends(require_auth)):
+    db = get_db()
+    rows = await db.dewi_cmt_disbursements.find({'payment_id': payment_id, 'status': {'$ne': 'voided'}}, {'_id': 0}).sort('payment_date', -1).to_list(200)
+    return serialize_doc(rows)
+
+
+@router.post('/cmt-payments/{payment_id}/pay')
+async def pay_cmt_payment(payment_id: str, payload: CmtPayIn, user: dict = Depends(require_auth)):
+    """Bayar tagihan CMT dari rekening kas/bank. AP CMT diposting dulu bila belum; jurnal bayar otomatis."""
+    db = get_db()
+    payment = await db.dewi_cmt_payments.find_one({'id': payment_id}, {'_id': 0})
+    if not payment:
+        raise HTTPException(404, 'Tagihan CMT tidak ditemukan')
+    if payment.get('status') in ('cancelled', 'void'):
+        raise HTTPException(400, f"Tagihan berstatus {payment.get('status')} tidak bisa dibayar")
+    acc = await db.rahaza_cash_accounts.find_one({'id': payload.cash_account_id}, {'_id': 0})
+    if not acc:
+        raise HTTPException(400, 'Rekening kas/bank tidak ditemukan')
+    total = _cmt_amount(payment)
+    paid_before = float(payment.get('paid_amount') or 0)
+    outstanding = round(total - paid_before, 2)
+    amount = float(payload.amount) if payload.amount else outstanding
+    if outstanding <= 0:
+        raise HTTPException(400, 'Tagihan sudah lunas')
+    if amount > outstanding + 0.01:
+        raise HTTPException(400, f'Pembayaran melebihi sisa tagihan (Rp {outstanding:,.0f})')
+    if not payment.get('gl_je_id'):
+        ap = await post_cmt_ap_invoice(db, payment, user)
+        if not ap.get('ok'):
+            raise HTTPException(400, f"AP CMT belum bisa diposting ke GL: {ap.get('error')}")
+        payment = await db.dewi_cmt_payments.find_one({'id': payment_id}, {'_id': 0})
+    pay_date = payload.payment_date or date.today().isoformat()
+    did = _uid()
+    await db.rahaza_cash_movements.insert_one({
+        'id': did, 'account_id': acc['id'], 'account_name': acc.get('name'), 'direction': 'out', 'amount': round(amount),
+        'category': 'ap_payment', 'ref_id': payment_id, 'ref_label': payment.get('payment_code'),
+        'source_module': 'cmt_payment', 'date': pay_date, 'notes': payload.notes or '',
+        'timestamp': _now(), 'created_by': user.get('id'), 'created_by_name': user.get('name', ''),
+    })
+    await db.rahaza_cash_accounts.update_one({'id': acc['id']}, {'$inc': {'balance': -round(amount)}})
+    from routes.rahaza_posting import post_ap_payment
+    pseudo = {'id': payment_id, 'invoice_number': payment.get('payment_code'), 'vendor_name': payment.get('cmt_name'),
+              'gl_ap_account_code': payment.get('gl_ap_account_code')}
+    gl = await post_ap_payment(db, pseudo, amount, acc['id'], pay_date, user, movement_id=did)
+    paid_after = round(paid_before + amount, 2)
+    status = 'paid' if paid_after >= total - 0.01 else 'partial_paid'
+    doc = {'id': did, 'payment_id': payment_id, 'payment_code': payment.get('payment_code'), 'cmt_name': payment.get('cmt_name'),
+           'amount': amount, 'payment_date': pay_date, 'cash_account_id': acc['id'], 'cash_account_name': acc.get('name'),
+           'reference_no': payload.reference_no or '', 'notes': payload.notes or '', 'status': 'posted',
+           'gl_je_id': gl.get('je_id'), 'gl_je_number': gl.get('je_number'), 'post_error': gl.get('error'),
+           'created_at': _now(), 'created_by': user.get('id'), 'created_by_name': user.get('name', '')}
+    await db.dewi_cmt_disbursements.insert_one(dict(doc))
+    await db.dewi_cmt_payments.update_one({'id': payment_id}, {'$set': {
+        'paid_amount': paid_after, 'outstanding_amount': round(total - paid_after, 2), 'status': status,
+        'paid_at': _now() if status == 'paid' else None, 'last_payment_date': pay_date, 'updated_at': _now()}})
+    await log_activity(user.get('id', ''), user.get('name', ''), 'pay_cmt', 'dewi_cmt_payments',
+                       f"Bayar {payment.get('payment_code')} Rp {amount:,.0f} via {acc.get('name')}")
+    return serialize_doc({**doc, 'payment_status': status, 'outstanding_amount': round(total - paid_after, 2)})
+
+
+@router.post('/cmt-payments/{payment_id}/disbursements/{did}/void')
+async def void_cmt_disbursement(payment_id: str, did: str, user: dict = Depends(require_auth)):
+    db = get_db()
+    d = await db.dewi_cmt_disbursements.find_one({'id': did, 'payment_id': payment_id, 'status': {'$ne': 'voided'}}, {'_id': 0})
+    if not d:
+        raise HTTPException(404, 'Pembayaran tidak ditemukan')
+    from routes.rahaza_posting import _void_je_by_source
+    v = await _void_je_by_source(db, 'ap_payment', f"appay:{did}:{int(round(float(d['amount'])))}", user, 'Pembayaran CMT dibatalkan')
+    if not v.get('ok'):
+        raise HTTPException(400, f"Jurnal tidak bisa di-void: {v.get('error')}")
+    mv = await db.rahaza_cash_movements.find_one({'id': did}, {'_id': 0})
+    if mv:
+        await db.rahaza_cash_movements.delete_one({'id': did})
+        await db.rahaza_cash_accounts.update_one({'id': mv['account_id']}, {'$inc': {'balance': float(mv['amount'])}})
+    await db.dewi_cmt_disbursements.update_one({'id': did}, {'$set': {'status': 'voided', 'voided_at': _now(), 'voided_by': user.get('id')}})
+    payment = await db.dewi_cmt_payments.find_one({'id': payment_id}, {'_id': 0})
+    total = _cmt_amount(payment)
+    paid = round(float(payment.get('paid_amount') or 0) - float(d['amount']), 2)
+    paid = max(paid, 0.0)
+    status = 'paid' if paid >= total - 0.01 else ('partial_paid' if paid > 0 else ('posted' if payment.get('gl_je_id') else 'draft'))
+    await db.dewi_cmt_payments.update_one({'id': payment_id}, {'$set': {
+        'paid_amount': paid, 'outstanding_amount': round(total - paid, 2), 'status': status, 'paid_at': None, 'updated_at': _now()}})
+    return {'ok': True, 'payment_status': status, 'voided_je': v.get('je_number')}

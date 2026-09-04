@@ -1693,17 +1693,34 @@ async def post_wip_to_fg_on_job_complete(db, job: dict, user: dict) -> dict:
         await _save_source_posting_result(db, "production_jobs", job["id"], result, prefix="wip")
         return result
 
-    # 1) Nilai WIP = total JE material issue utk MI job ini
+    # C-03 absorption: nilai FG = Σ lapisan biaya FG batch PO ini (bahan + jahit
+    # cmt_price_snapshot + permak + internal + overhead) — angka yang SAMA dgn yang
+    # dipakai COGS dispatch (FIFO lapisan), sehingga FG tidak bersaldo negatif &
+    # upah jahit tidak dibukukan dua kali (AP CMT internal sudah Dr WIP 1-1403).
     total_wip = 0.0
-    mis = await db.rahaza_material_issues.find(
-        {"job_id": job["id"], "status": "issued"}, {"_id": 0}).to_list(200)
-    for mi in mis:
-        je = await _find_existing_je(db, "inventory_issue", f"mi:{mi['id']}")
-        if je:
-            total_wip += float(je.get("total_debit") or 0)
+    basis = "fg_cost_layers"
+    layer_ids = []
+    if job.get("po_id"):
+        async for ly in db.fg_cost_layers.find(
+                {"batch.po_id": job["po_id"], "gl_job_id": {"$in": [None, job["id"]]}}, {"_id": 0}):
+            total_wip += float(ly.get("total_cost") or 0)
+            layer_ids.append(ly["id"])
+    if total_wip <= 0:
+        # 1) Fallback: JE material issue utk MI job ini + upah jahit (cmt_price_snapshot × qty baik)
+        basis = "material_issues"
+        mis = await db.rahaza_material_issues.find(
+            {"job_id": job["id"], "status": "issued"}, {"_id": 0}).to_list(200)
+        for mi in mis:
+            je = await _find_existing_je(db, "inventory_issue", f"mi:{mi['id']}")
+            if je:
+                total_wip += float(je.get("total_debit") or 0)
+        qty_good = float(job.get("qty_good") or job.get("qty_accepted") or job.get("qty_completed") or 0)
+        rate = float(job.get("cmt_price_snapshot") or 0)
+        if total_wip > 0 and qty_good > 0 and rate > 0:
+            total_wip += qty_good * rate
+            basis = "material_issues+sewing"
 
     # 2) Fallback: HPP snapshot job (material + labor + overhead)
-    basis = "material_issues"
     if total_wip <= 0:
         snap = await db.rahaza_hpp_snapshots.find_one({"job_id": job["id"]}, {"_id": 0})
         if snap:
@@ -1739,6 +1756,9 @@ async def post_wip_to_fg_on_job_complete(db, job: dict, user: dict) -> dict:
          "description": f"WIP keluar — Job {job.get('job_number', '')} ({basis})"},
     ]
     result = await _create_posted_je(db, je_date, memo, "production_job", source_ref, lines, user)
+    if result.get("ok") and layer_ids:
+        await db.fg_cost_layers.update_many({"id": {"$in": layer_ids}},
+                                            {"$set": {"gl_job_id": job["id"], "gl_je_id": result["je_id"]}})
     result["basis"] = basis
     result["amount"] = total_wip
     await _save_source_posting_result(db, "production_jobs", job["id"], result, prefix="wip")

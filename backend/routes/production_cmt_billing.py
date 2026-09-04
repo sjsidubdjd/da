@@ -33,7 +33,7 @@ from core.pagination import _paginate_params, _paginated_envelope
 
 router = APIRouter(prefix="/api/production/cmt-billing", tags=["production-cmt-billing"], dependencies=[Depends(deny_external_dep)])
 # status yang dianggap masih menjadi kewajiban (outstanding)
-_OPEN_STATUS = ('draft', 'submitted', 'approved', 'pending')
+_OPEN_STATUS = ('draft', 'submitted', 'approved', 'pending', 'posted', 'partial_paid')
 
 
 def _amount(p: dict) -> float:
@@ -78,6 +78,9 @@ def _enrich(p: dict, domain: str, entry: dict | None = None) -> dict:
         'amount': _amount(p),
         'penalty': float(p.get('total_penalty', 0) or 0),
         'gl_posted': bool(p.get('gl_je_id')),
+        'paid_amount': float(p.get('paid_amount') or 0),
+        'outstanding_amount': float(p.get('outstanding_amount') if p.get('outstanding_amount') is not None
+                                    else _amount(p) - float(p.get('paid_amount') or 0)),
         # keputusan owner 3a — badge "diinput staf DA" pada tagihan CMT.
         **(entry or {'progress_entry_source': 'none', 'staff_entered_progress_qty': 0,
                      'staff_entered_by': [], 'declaration_entered_by_staff': False,
@@ -241,8 +244,8 @@ async def cmt_billing_summary(request: Request):
         'not_posted': len([r for r in rows if not r['gl_posted'] and st(r) != 'cancelled']),
         'variance_flagged': len([r for r in rows if r.get('variance_flagged')]),
         'total_amount': _sum(lambda r: st(r) != 'cancelled'),
-        'outstanding_amount': _sum(lambda r: st(r) in _OPEN_STATUS),
-        'paid_amount': _sum(lambda r: st(r) == 'paid'),
+        'outstanding_amount': round(sum(r['outstanding_amount'] for r in rows if st(r) in _OPEN_STATUS), 2),
+        'paid_amount': round(sum(r['paid_amount'] for r in rows if st(r) != 'cancelled'), 2),
         'total_pcs': sum(int(r.get('total_pcs', 0) or 0) for r in rows if st(r) != 'cancelled'),
     }
 
